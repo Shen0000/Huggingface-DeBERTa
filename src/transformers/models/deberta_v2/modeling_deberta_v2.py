@@ -537,7 +537,7 @@ def make_log_bucket_position(relative_pos, bucket_size, max_position):
 
 @lru_cache(maxsize=None)
 def build_rel_pos_ids(query_size, key_size):  # KZ
-    grid_dim = math.isqrt(query_size)
+    grid_dim = int(math.sqrt(query_size))
     assert query_size == key_size == grid_dim ** 2
 
     r, c = np.mgrid[0:grid_dim, 0:grid_dim]
