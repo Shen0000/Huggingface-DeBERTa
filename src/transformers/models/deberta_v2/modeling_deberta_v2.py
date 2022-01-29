@@ -359,7 +359,7 @@ class ConvLayer(nn.Module):
         kernel_size = getattr(config, "conv_kernel_size", 3)
         groups = getattr(config, "conv_groups", 1)
         self.conv_act = getattr(config, "conv_act", "tanh")
-        self.conv = nn.Conv1d(
+        self.conv = nn.Conv2d(
             config.hidden_size, config.hidden_size, kernel_size, padding=(kernel_size - 1) // 2, groups=groups
         )
         self.LayerNorm = LayerNorm(config.hidden_size, config.layer_norm_eps)
@@ -367,7 +367,11 @@ class ConvLayer(nn.Module):
         self.config = config
 
     def forward(self, hidden_states, residual_states, input_mask):
-        out = self.conv(hidden_states.permute(0, 2, 1).contiguous()).permute(0, 2, 1).contiguous()
+        batch_size, seq_len, embed_dim = hidden_states.size()
+        grid_dim = int(math.sqrt(seq_len))
+        assert grid_dim ** 2 == seq_len
+        out = self.conv(hidden_states.permute(0, 2, 1).view(batch_size, embed_dim, grid_dim, grid_dim).contiguous())\
+            .flatten(-2).permute(0, 2, 1).contiguous()
         rmask = (1 - input_mask).bool()
         out.masked_fill_(rmask.unsqueeze(-1).expand(out.size()), 0)
         out = ACT2FN[self.conv_act](self.dropout(out))
