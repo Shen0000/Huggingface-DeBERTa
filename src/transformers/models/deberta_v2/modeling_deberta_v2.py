@@ -36,7 +36,6 @@ from ...modeling_utils import PreTrainedModel
 from ...utils import logging
 from .configuration_deberta_v2 import DebertaV2Config
 
-
 logger = logging.get_logger(__name__)
 
 _CONFIG_FOR_DOC = "DebertaV2Config"
@@ -258,13 +257,13 @@ class DebertaV2Attention(nn.Module):
         self.config = config
 
     def forward(
-        self,
-        hidden_states,
-        attention_mask,
-        output_attentions=False,
-        query_states=None,
-        relative_pos=None,
-        rel_embeddings=None,
+            self,
+            hidden_states,
+            attention_mask,
+            output_attentions=False,
+            query_states=None,
+            relative_pos=None,
+            rel_embeddings=None,
     ):
         self_output = self.self(
             hidden_states,
@@ -327,13 +326,13 @@ class DebertaV2Layer(nn.Module):
         self.output = DebertaV2Output(config)
 
     def forward(
-        self,
-        hidden_states,
-        attention_mask,
-        query_states=None,
-        relative_pos=None,
-        rel_embeddings=None,
-        output_attentions=False,
+            self,
+            hidden_states,
+            attention_mask,
+            query_states=None,
+            relative_pos=None,
+            rel_embeddings=None,
+            output_attentions=False,
     ):
         attention_output = self.attention(
             hidden_states,
@@ -366,12 +365,17 @@ class ConvLayer(nn.Module):
         self.dropout = StableDropout(config.hidden_dropout_prob)
         self.config = config
 
-    def forward(self, hidden_states, residual_states, input_mask):
+    def forward(self, num_rows, num_cols, start_token, hidden_states, residual_states, input_mask):
         batch_size, seq_len, embed_dim = hidden_states.size()
-        grid_dim = int(math.sqrt(seq_len))
-        assert grid_dim ** 2 == seq_len
-        out = self.conv(hidden_states.permute(0, 2, 1).view(batch_size, embed_dim, grid_dim, grid_dim).contiguous())\
-            .flatten(-2).permute(0, 2, 1).contiguous()
+
+        assert num_rows * num_cols == seq_len - (1 if start_token else 0)
+        out = self.conv((hidden_states[:, 1:, :] if start_token else hidden_states).permute(0, 2, 1)
+                        .view(batch_size, embed_dim, num_rows, num_cols).contiguous()).flatten(-2).permute(0, 2, 1).contiguous()
+
+        if start_token:
+            hidden_states[:, 1:, :] = out
+            out = hidden_states
+
         rmask = (1 - input_mask).bool()
         out.masked_fill_(rmask.unsqueeze(-1).expand(out.size()), 0)
         out = ACT2FN[self.conv_act](self.dropout(out))
@@ -413,6 +417,7 @@ class DebertaV2Encoder(nn.Module):
             if self.position_buckets > 0:
                 pos_ebd_size = self.position_buckets * 2
 
+            self.cls = getattr(config, "cls", False)
             self.rel_embeddings = nn.Embedding(pos_ebd_size, config.hidden_size)
 
         self.norm_rel_ebd = [x.strip() for x in getattr(config, "norm_rel_ebd", "none").lower().split("|")]
@@ -439,30 +444,34 @@ class DebertaV2Encoder(nn.Module):
 
         return attention_mask
 
-    def get_rel_pos(self, hidden_states, query_states=None, relative_pos=None):
+    def get_rel_pos(self, num_rows, num_cols, start_token, hidden_states, query_states=None, relative_pos=None):
         if self.relative_attention and relative_pos is None:
             q = query_states.size(-2) if query_states is not None else hidden_states.size(-2)
             relative_pos = build_relative_position(
-                q, hidden_states.size(-2), bucket_size=self.position_buckets, max_position=self.max_relative_positions
+                num_rows, num_cols, start_token, q, hidden_states.size(-2),
+                bucket_size=self.position_buckets, max_position=self.max_relative_positions
             )
         return relative_pos
 
     def forward(
-        self,
-        hidden_states,
-        attention_mask,
-        output_hidden_states=True,
-        output_attentions=False,
-        query_states=None,
-        relative_pos=None,
-        return_dict=True,
+            self,
+            num_rows,
+            num_cols,
+            start_token,
+            hidden_states,
+            attention_mask,
+            output_hidden_states=True,
+            output_attentions=False,
+            query_states=None,
+            relative_pos=None,
+            return_dict=True,
     ):
         if attention_mask.dim() <= 2:
             input_mask = attention_mask
         else:
             input_mask = (attention_mask.sum(-2) > 0).byte()
         attention_mask = self.get_attention_mask(attention_mask)
-        relative_pos = self.get_rel_pos(hidden_states, query_states, relative_pos)
+        relative_pos = self.get_rel_pos(num_rows, num_cols, start_token, hidden_states, query_states, relative_pos)
 
         all_hidden_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
@@ -508,7 +517,7 @@ class DebertaV2Encoder(nn.Module):
                 output_states, att_m = output_states
 
             if i == 0 and self.conv is not None:
-                output_states = self.conv(hidden_states, output_states, input_mask)
+                output_states = self.conv(num_rows, num_cols, start_token, hidden_states, output_states, input_mask)
 
             if query_states is not None:
                 query_states = output_states
@@ -540,17 +549,18 @@ def make_log_bucket_position(relative_pos, bucket_size, max_position):
 
 
 @lru_cache(maxsize=None)
-def build_rel_pos_ids(query_size, key_size):  # KZ
-    grid_dim = int(math.sqrt(query_size))
-    assert query_size == key_size == grid_dim ** 2
+def build_rel_pos_ids(num_rows, num_cols, start_token, query_size, key_size):  # KZ
+    assert query_size == key_size == (num_rows * num_cols + 1 if start_token else num_rows * num_cols)
 
-    r, c = np.mgrid[0:grid_dim, 0:grid_dim]
+    r, c = np.mgrid[:num_rows, :num_cols]
     rc = np.vstack((r.flatten(), c.flatten())).T
-    rel_pos_ids = np.abs(rc[:,None] - rc).sum(-1)
-    return rel_pos_ids
+    rel_pos_ids = np.abs(rc[:, None] - rc).sum(-1)
+
+    print(f"cls: {start_token}, ({num_rows}, {num_cols})")
+    return np.pad(rel_pos_ids, ((1, 0), (1, 0)), constant_values=9999) if start_token else rel_pos_ids
 
 
-def build_relative_position(query_size, key_size, bucket_size=-1, max_position=-1):
+def build_relative_position(num_rows, num_cols, start_token, query_size, key_size, bucket_size=-1, max_position=-1):
     """
     Build relative position according to the query and key
 
@@ -559,6 +569,9 @@ def build_relative_position(query_size, key_size, bucket_size=-1, max_position=-
     P_q - P_k\\)
 
     Args:
+        num_rows (int): number of rows in the Generals map
+        num_cols (int): number of columns in the Generals map
+        start_token (boolean): whether there is an extra "tile" with auxiliary information
         query_size (int): the length of query
         key_size (int): the length of key
         bucket_size (int): the size of position bucket
@@ -568,10 +581,7 @@ def build_relative_position(query_size, key_size, bucket_size=-1, max_position=-
         `torch.LongTensor`: A tensor with shape [1, query_size, key_size]
 
     """
-    # q_ids = np.arange(0, query_size)
-    # k_ids = np.arange(0, key_size)
-    # rel_pos_ids = q_ids[:, None] - np.tile(k_ids, (q_ids.shape[0], 1))
-    rel_pos_ids = build_rel_pos_ids(query_size, key_size)  # KZ
+    rel_pos_ids = build_rel_pos_ids(num_rows, num_cols, start_token, query_size, key_size)  # KZ
     if bucket_size > 0 and max_position > 0:
         rel_pos_ids = make_log_bucket_position(rel_pos_ids, bucket_size, max_position)
     rel_pos_ids = torch.tensor(rel_pos_ids, dtype=torch.long)
@@ -637,6 +647,7 @@ class DisentangledSelfAttention(nn.Module):
             if self.position_buckets > 0:
                 self.pos_ebd_size = self.position_buckets
 
+            self.cls = getattr(config, "cls", False)
             self.pos_dropout = StableDropout(config.hidden_dropout_prob)
 
             if not self.share_att_key:
@@ -653,13 +664,13 @@ class DisentangledSelfAttention(nn.Module):
         return x.permute(0, 2, 1, 3).contiguous().view(-1, x.size(1), x.size(-1))
 
     def forward(
-        self,
-        hidden_states,
-        attention_mask,
-        output_attentions=False,
-        query_states=None,
-        relative_pos=None,
-        rel_embeddings=None,
+            self,
+            hidden_states,
+            attention_mask,
+            output_attentions=False,
+            query_states=None,
+            relative_pos=None,
+            rel_embeddings=None,
     ):
         """
         Call the module
@@ -728,8 +739,8 @@ class DisentangledSelfAttention(nn.Module):
         )
         context_layer = (
             context_layer.view(-1, self.num_attention_heads, context_layer.size(-2), context_layer.size(-1))
-            .permute(0, 2, 1, 3)
-            .contiguous()
+                .permute(0, 2, 1, 3)
+                .contiguous()
         )
         new_context_layer_shape = context_layer.size()[:-2] + (-1,)
         context_layer = context_layer.view(*new_context_layer_shape)
@@ -742,7 +753,8 @@ class DisentangledSelfAttention(nn.Module):
         if relative_pos is None:
             q = query_layer.size(-2)
             relative_pos = build_relative_position(
-                q, key_layer.size(-2), bucket_size=self.position_buckets, max_position=self.max_relative_positions
+                q, key_layer.size(-2), bucket_size=self.position_buckets,
+                max_position=self.max_relative_positions, cls=self.cls
             )
         if relative_pos.dim() == 2:
             relative_pos = relative_pos.unsqueeze(0).unsqueeze(0)
@@ -755,7 +767,7 @@ class DisentangledSelfAttention(nn.Module):
         att_span = self.pos_ebd_size
         relative_pos = relative_pos.long().to(query_layer.device)
 
-        rel_embeddings = rel_embeddings[self.pos_ebd_size - att_span : self.pos_ebd_size + att_span, :].unsqueeze(0)
+        rel_embeddings = rel_embeddings[self.pos_ebd_size - att_span: self.pos_ebd_size + att_span, :].unsqueeze(0)
         if self.share_att_key:
             pos_query_layer = self.transpose_for_scores(
                 self.query_proj(rel_embeddings), self.num_attention_heads
@@ -799,6 +811,7 @@ class DisentangledSelfAttention(nn.Module):
                     key_layer.size(-2),
                     bucket_size=self.position_buckets,
                     max_position=self.max_relative_positions,
+                    cls=self.cls
                 ).to(query_layer.device)
                 r_pos = r_pos.unsqueeze(0)
             else:
@@ -1035,15 +1048,18 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        inputs_embeds=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
+            self,
+            num_rows,
+            num_cols,
+            start_token,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
     ):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1076,6 +1092,9 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         )
 
         encoder_outputs = self.encoder(
+            num_rows,
+            num_cols,
+            start_token,
             embedding_output,
             attention_mask,
             output_hidden_states=True,
@@ -1105,7 +1124,7 @@ class DebertaV2Model(DebertaV2PreTrainedModel):
         sequence_output = encoded_layers[-1]
 
         if not return_dict:
-            return (sequence_output,) + encoder_outputs[(1 if output_hidden_states else 2) :]
+            return (sequence_output,) + encoder_outputs[(1 if output_hidden_states else 2):]
 
         return BaseModelOutput(
             last_hidden_state=sequence_output,
@@ -1143,16 +1162,16 @@ class DebertaV2ForMaskedLM(DebertaV2PreTrainedModel):
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
+            self,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            labels=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
     ):
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1284,16 +1303,16 @@ class DebertaV2ForSequenceClassification(DebertaV2PreTrainedModel):
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
+            self,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            labels=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
     ):
         r"""
         labels (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
@@ -1392,16 +1411,16 @@ class DebertaV2ForTokenClassification(DebertaV2PreTrainedModel):
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        inputs_embeds=None,
-        labels=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
+            self,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            labels=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
     ):
         r"""
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
@@ -1477,17 +1496,17 @@ class DebertaV2ForQuestionAnswering(DebertaV2PreTrainedModel):
         config_class=_CONFIG_FOR_DOC,
     )
     def forward(
-        self,
-        input_ids=None,
-        attention_mask=None,
-        token_type_ids=None,
-        position_ids=None,
-        inputs_embeds=None,
-        start_positions=None,
-        end_positions=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
+            self,
+            input_ids=None,
+            attention_mask=None,
+            token_type_ids=None,
+            position_ids=None,
+            inputs_embeds=None,
+            start_positions=None,
+            end_positions=None,
+            output_attentions=None,
+            output_hidden_states=None,
+            return_dict=None,
     ):
         r"""
         start_positions (`torch.LongTensor` of shape `(batch_size,)`, *optional*):
